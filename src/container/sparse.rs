@@ -7,4 +7,4 @@ pub mod writer;
 // Re-export common types
 pub use format::*;
 pub use reader::SparseReader;
-pub use writer::SparseWriter;
+pub use writer::{SparseWriter, convert_to_sparse};

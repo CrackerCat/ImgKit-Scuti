@@ -5,18 +5,26 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::{Arc, RwLock};
 
-pub struct F2fsVolume {
-    file: Arc<RwLock<File>>,
+// Generic read backend over any Read+Seek source (File, SparseReader, ...)
+pub struct F2fsVolume<R: Read + Seek + Send = File> {
+    file: Arc<RwLock<R>>,
     pub superblock: Superblock,
     nat_cache: Arc<RwLock<HashMap<Nid, NatEntry>>>,
     nat_journal_cache: Arc<RwLock<HashMap<Nid, NatEntry>>>,
     nat_blocks_per_copy: u32,
 }
 
-impl F2fsVolume {
+impl F2fsVolume<File> {
     pub fn new(path: &str) -> Result<Self> {
         let file = File::open(path)?;
-        let file = Arc::new(RwLock::new(file));
+        Self::from_reader(file)
+    }
+}
+
+impl<R: Read + Seek + Send> F2fsVolume<R> {
+    // Construct from any Read+Seek stream (plain file or sparse virtual stream)
+    pub fn from_reader(reader: R) -> Result<Self> {
+        let file = Arc::new(RwLock::new(reader));
 
         // Read superblock
         let mut buf = vec![0u8; F2FS_BLKSIZE];
@@ -61,7 +69,7 @@ impl F2fsVolume {
         Self::read_block_raw(&self.file, block)
     }
 
-    fn read_block_raw(file: &Arc<RwLock<File>>, block: Block) -> Result<Vec<u8>> {
+    fn read_block_raw(file: &Arc<RwLock<R>>, block: Block) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; F2FS_BLKSIZE];
         let offset = block.0 as u64 * F2FS_BLKSIZE as u64;
 
@@ -103,7 +111,7 @@ impl F2fsVolume {
     }
 
     fn load_nat_journal(
-        file: &Arc<RwLock<File>>,
+        file: &Arc<RwLock<R>>,
         cp_blkaddr: u32,
         cp_header: &[u8],
     ) -> Result<HashMap<Nid, NatEntry>> {

@@ -23,6 +23,8 @@ pub fn run_f2fs_pack(
     root_gid: u32,
     timestamp: Option<u64>,
 ) -> Result<()> {
+    use crate::container::sparse::convert_to_sparse;
+    use crate::filesystem::f2fs::consts::F2FS_BLKSIZE;
     use crate::filesystem::f2fs::types::{F2fsBuilderConfig, F2fsFeatures};
     use crate::filesystem::f2fs::write::F2fsBuilder;
 
@@ -70,6 +72,29 @@ pub fn run_f2fs_pack(
     // Create builder and build
     let mut builder = F2fsBuilder::new(config)?;
     builder.build()?;
+
+    // Builder only emits raw image; convert to sparse here as a post-processing step.
+    // On failure, keep the raw temp so the user does not lose the freshly built image.
+    if sparse {
+        let raw_tmp = format!("{}.raw.{}.tmp", output, std::process::id());
+        std::fs::rename(output, &raw_tmp)?;
+        match convert_to_sparse(
+            std::path::Path::new(&raw_tmp),
+            std::path::Path::new(output),
+            F2FS_BLKSIZE as u32,
+        ) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&raw_tmp);
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "convert_to_sparse failed: {}; raw image preserved at {}",
+                    e,
+                    raw_tmp
+                ));
+            }
+        }
+    }
 
     log::info!("F2FS image built: {}", output);
     Ok(())

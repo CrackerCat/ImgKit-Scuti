@@ -220,6 +220,11 @@ fn detect_sparse_filesystem(file: &mut File) -> Result<String> {
         return Ok("sparse_ext4".to_string());
     }
 
+    // F2FS superblock magic at virtual offset 1024
+    if virtual_data.len() >= 1028 && virtual_data[1024..1028] == [0x10, 0x20, 0xf5, 0xf2] {
+        return Ok("sparse_f2fs".to_string());
+    }
+
     Err(anyhow!("unrecognized filesystem type in sparse image"))
 }
 

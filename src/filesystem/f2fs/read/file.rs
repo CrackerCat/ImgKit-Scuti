@@ -1,9 +1,9 @@
 use super::volume::F2fsVolume;
 use crate::filesystem::f2fs::*;
 use byteorder::{LittleEndian, ReadBytesExt};
-use std::io::Cursor;
+use std::io::{Cursor, Read, Seek};
 
-impl F2fsVolume {
+impl<R: Read + Seek + Send> F2fsVolume<R> {
     pub fn read_file_data(&self, inode: &Inode, nid: Nid) -> Result<Vec<u8>> {
         const MAX_FILE_SIZE: u64 = 16 * 1024 * 1024 * 1024;
         if inode.size == 0 {

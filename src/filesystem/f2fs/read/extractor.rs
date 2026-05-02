@@ -2,6 +2,7 @@
 //
 // Provides file system extraction and configuration generation functions
 
+use crate::container::sparse::SparseReader;
 use crate::filesystem::f2fs::{F2fsVolume, Inode, Nid};
 use crate::utils::{
     check_windows_case_conflict, create_symlink, display_completion, display_progress,
@@ -12,7 +13,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -40,11 +41,25 @@ struct FileTask {
     file_type: u8,
 }
 
-// Extract the F2FS image file to the specified directory
+// Entry point: auto-detect sparse vs raw image and dispatch to the matching reader
 pub fn extract_image(config: ExtractConfig) -> Result<()> {
-    let start_time = Instant::now();
+    if let Ok(sparse_reader) = SparseReader::new(&config.input_image) {
+        let volume = F2fsVolume::from_reader(sparse_reader)
+            .map_err(|e| anyhow::anyhow!("解析 sparse F2FS superblock 失败: {}", e))?;
+        return extract(config, volume, true);
+    }
 
-    let reader = F2fsVolume::new(&config.input_image)?;
+    let volume = F2fsVolume::new(&config.input_image)
+        .map_err(|e| anyhow::anyhow!("打开 F2FS 镜像失败: {}", e))?;
+    extract(config, volume, false)
+}
+
+fn extract<R: Read + Seek + Send + Sync>(
+    config: ExtractConfig,
+    volume: F2fsVolume<R>,
+    is_sparse: bool,
+) -> Result<()> {
+    let start_time = Instant::now();
 
     // Detect partition name
     let partition_name = Path::new(&config.input_image)
@@ -75,7 +90,7 @@ pub fn extract_image(config: ExtractConfig) -> Result<()> {
     let mut file_contexts = HashMap::new();
 
     // Extract xattr of root directory (consistent with EXT4/EROFS)
-    let root_node = reader.read_node(root_nid)?;
+    let root_node = volume.read_node(root_nid)?;
     let root_inode = Inode::from_bytes(&root_node)?;
     fs_config.push((
         PathBuf::from("/"),
@@ -86,7 +101,7 @@ pub fn extract_image(config: ExtractConfig) -> Result<()> {
         String::new(),
     ));
     extract_xattrs(
-        &reader,
+        &volume,
         &root_inode,
         root_nid,
         &PathBuf::from("/"),
@@ -97,7 +112,7 @@ pub fn extract_image(config: ExtractConfig) -> Result<()> {
     let mut file_tasks = Vec::new();
     let mut visited = std::collections::HashSet::new();
     collect_directory_tasks(
-        &reader,
+        &volume,
         root_nid,
         Path::new("/"),
         &extract_path,
@@ -115,48 +130,76 @@ pub fn extract_image(config: ExtractConfig) -> Result<()> {
     let failed_count = Arc::new(AtomicUsize::new(0));
     let total_task_count = file_tasks.len();
 
-    file_tasks.par_iter().for_each_init(
-        || F2fsVolume::new(image_path_arc.as_str()).ok(),
-        |thread_volume, task| {
-            if let Some(volume) = thread_volume.as_ref() {
-                let result: Result<()> = if task.file_type == 7 {
-                    match volume.read_symlink_target(&task.inode, task.nid) {
-                        Ok(link_target) => {
-                            if task.output_path.exists() {
-                                let _ = fs::remove_file(&task.output_path);
-                            }
-                            create_symlink(&link_target, &task.output_path)
+    macro_rules! process_task {
+        ($vol:expr, $task:expr) => {{
+            let result: Result<()> = if $task.file_type == 7 {
+                match $vol.read_symlink_target(&$task.inode, $task.nid) {
+                    Ok(link_target) => {
+                        if $task.output_path.exists() {
+                            let _ = fs::remove_file(&$task.output_path);
                         }
-                        Err(e) => Err(anyhow::anyhow!("读取符号链接目标失败: {}", e)),
+                        create_symlink(&link_target, &$task.output_path)
                     }
-                } else if task.inode.is_reg() {
-                    match volume.read_file_data(&task.inode, task.nid) {
-                        Ok(data) => match File::create(&task.output_path) {
-                            Ok(mut file) => match file.write_all(&data) {
-                                Ok(_) => Ok(()),
-                                Err(e) => Err(anyhow::anyhow!("写入文件失败: {}", e)),
-                            },
-                            Err(e) => Err(anyhow::anyhow!("创建文件失败: {}", e)),
+                    Err(e) => Err(anyhow::anyhow!("读取符号链接目标失败: {}", e)),
+                }
+            } else if $task.inode.is_reg() {
+                match $vol.read_file_data(&$task.inode, $task.nid) {
+                    Ok(data) => match File::create(&$task.output_path) {
+                        Ok(mut file) => match file.write_all(&data) {
+                            Ok(_) => Ok(()),
+                            Err(e) => Err(anyhow::anyhow!("写入文件失败: {}", e)),
                         },
-                        Err(e) => Err(anyhow::anyhow!("读取文件数据失败: {}", e)),
-                    }
-                } else {
-                    Ok(())
-                };
-
-                if let Err(e) = result {
-                    log::warn!(" 提取 {:?} 失败: {}", task.path, e);
-                    failed_count.fetch_add(1, Ordering::Relaxed);
+                        Err(e) => Err(anyhow::anyhow!("创建文件失败: {}", e)),
+                    },
+                    Err(e) => Err(anyhow::anyhow!("读取文件数据失败: {}", e)),
                 }
             } else {
-                log::warn!("线程内 F2FS volume 初始化失败，跳过 {:?}", task.path);
+                Ok(())
+            };
+
+            if let Err(e) = result {
+                log::warn!(" 提取 {:?} 失败: {}", $task.path, e);
                 failed_count.fetch_add(1, Ordering::Relaxed);
             }
 
             let count = extracted_count.fetch_add(1, Ordering::Relaxed) + 1;
             display_progress(filename, count, total_task_count);
-        },
-    );
+        }};
+    }
+
+    if is_sparse {
+        file_tasks.par_iter().for_each_init(
+            || {
+                SparseReader::new(image_path_arc.as_str())
+                    .ok()
+                    .and_then(|reader| F2fsVolume::from_reader(reader).ok())
+            },
+            |thread_volume, task| {
+                if let Some(volume) = thread_volume.as_ref() {
+                    process_task!(volume, task);
+                } else {
+                    log::warn!("线程内 F2FS sparse volume 初始化失败，跳过 {:?}", task.path);
+                    failed_count.fetch_add(1, Ordering::Relaxed);
+                    let count = extracted_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    display_progress(filename, count, total_task_count);
+                }
+            },
+        );
+    } else {
+        file_tasks.par_iter().for_each_init(
+            || F2fsVolume::new(image_path_arc.as_str()).ok(),
+            |thread_volume, task| {
+                if let Some(volume) = thread_volume.as_ref() {
+                    process_task!(volume, task);
+                } else {
+                    log::warn!("线程内 F2FS volume 初始化失败，跳过 {:?}", task.path);
+                    failed_count.fetch_add(1, Ordering::Relaxed);
+                    let count = extracted_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    display_progress(filename, count, total_task_count);
+                }
+            },
+        );
+    }
 
     display_completion(start_time.elapsed());
 
@@ -198,8 +241,8 @@ pub fn extract_image(config: ExtractConfig) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn collect_directory_tasks(
-    reader: &F2fsVolume,
+fn collect_directory_tasks<R: Read + Seek + Send>(
+    reader: &F2fsVolume<R>,
     nid: Nid,
     current_path: &Path,
     extract_path: &Path,
@@ -309,8 +352,8 @@ fn collect_directory_tasks(
 }
 
 // Extract extended attributes (xattrs) from inode
-fn extract_xattrs(
-    reader: &F2fsVolume,
+fn extract_xattrs<R: Read + Seek + Send>(
+    reader: &F2fsVolume<R>,
     inode: &Inode,
     nid: Nid,
     path: &Path,

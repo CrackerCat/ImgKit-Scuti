@@ -33,7 +33,7 @@ pub fn run_extract(
     }
 
     match fs_type.as_str() {
-        "f2fs" => {
+        "f2fs" | "sparse_f2fs" => {
             let config = f2fs_extractor::ExtractConfig {
                 input_image: input.to_string(),
                 output_dir: output.to_string(),

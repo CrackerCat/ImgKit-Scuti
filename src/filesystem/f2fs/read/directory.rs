@@ -1,7 +1,7 @@
 use super::volume::F2fsVolume;
 use crate::filesystem::f2fs::*;
 use byteorder::{LittleEndian, ReadBytesExt};
-use std::io::Cursor;
+use std::io::{Cursor, Read, Seek};
 
 #[derive(Debug)]
 pub struct DirEntry {
@@ -10,7 +10,7 @@ pub struct DirEntry {
     pub file_type: u8,
 }
 
-impl F2fsVolume {
+impl<R: Read + Seek + Send> F2fsVolume<R> {
     pub fn read_dir(&self, inode: &Inode, nid: Nid) -> Result<Vec<DirEntry>> {
         let blocks = self.read_data_blocks(inode, nid)?;
         let mut entries = Vec::new();

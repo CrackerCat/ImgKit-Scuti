@@ -4,8 +4,9 @@ use super::super::error::Result;
 use super::super::types::{Inode, Nid, XattrEntry};
 use super::volume::F2fsVolume;
 use crate::filesystem::f2fs::*;
+use std::io::{Read, Seek};
 
-impl F2fsVolume {
+impl<R: Read + Seek + Send> F2fsVolume<R> {
     // Read all xattr of inode
     pub fn read_xattrs(&self, inode: &Inode, nid: Nid) -> Result<Vec<(String, Vec<u8>)>> {
         let mut xattrs = Vec::new();
